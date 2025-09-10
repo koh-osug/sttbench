@@ -25,6 +25,26 @@ def main():
     ap.add_argument("--buffer", type=int, default=8000, help="Input blocksize (frames). Lower for lower latency.")
     ap.add_argument("--list-devices", action="store_true", help="List audio devices and exit.")
     ap.add_argument("--no-partials", action="store_true", help="Disable printing partial results.", default=False)
+    # Filtering options to reduce false single-word finals like "nun"
+    ap.add_argument("--min-words", type=int, default=1, help="Minimum words required to print a final result (after filtering).")
+    ap.add_argument(
+        "--min-avg-conf",
+        type=float,
+        default=0.6,
+        help="Minimum average word confidence for short (<=2 words) finals to be printed.",
+    )
+    ap.add_argument(
+        "--ignore-singletons",
+        type=str,
+        default="nun,äh,hm,ah,öh,öhm,öhm,ähm,und",
+        help="Comma-separated list of single words to ignore when they appear alone as a final result.",
+    )
+    ap.add_argument(
+        "--no-filter",
+        action="store_true",
+        default=False,
+        help="Disable final-result filtering (print everything Vosk returns).",
+    )
     args = ap.parse_args()
 
     if args.list_devices:
@@ -41,6 +61,9 @@ def main():
     print(f"Loading Vosk model from: {model_path} ...")
     model = Model(str(model_path))
     print("Model loaded. Listening... Press Ctrl+C to stop.\n")
+
+    # Build ignore set once
+    ignore_singletons = set(w.strip().lower() for w in args.ignore_singletons.split(",") if w.strip())
 
     q = queue.Queue()
 
@@ -59,6 +82,49 @@ def main():
     # Create recognizer
     rec = KaldiRecognizer(model, args.samplerate)
     rec.SetWords(True)
+
+    # Helper to decide whether to print a final result
+    def should_print_final(result_obj, text_str):
+        if args.no_filter:
+            return bool(text_str)
+
+        text_norm = text_str.strip().lower()
+        if not text_norm:
+            return False
+
+        words = text_norm.split()
+        n_words = len(words)
+
+        # Enforce minimum words if configured (>1 to be effective)
+        if n_words < max(1, args.min_words):
+            # Allow printing if confidence is clearly good (for true one-word commands),
+            # else suppress; we check conf below.
+            pass
+
+        # Compute average confidence if available
+        word_items = result_obj.get("result") or []
+        if word_items:
+            # Some models may provide "conf" per word; fall back to printing if missing
+            confs = [wi.get("conf") for wi in word_items if isinstance(wi.get("conf"), (int, float))]
+            if confs:
+                avg_conf = sum(confs) / len(confs)
+                # Stricter on very short outputs
+                if n_words <= 2 and avg_conf < args.min_avg_conf:
+                    return False
+
+        # Final minimal length check
+        if n_words < max(1, args.min_words):
+            return False
+
+        return True
+
+    # Helper to remove ignored words from any position
+    def filter_ignored_words(text: str) -> str:
+        if not text:
+            return text
+        words = text.split()
+        kept = [w for w in words if w.lower() not in ignore_singletons]
+        return " ".join(kept)
 
     # Open microphone stream
     try:
@@ -79,8 +145,9 @@ def main():
                 if rec.AcceptWaveform(data):
                     # Finalized segment
                     result = json.loads(rec.Result())
-                    text = result.get("text", "").strip()
-                    if text:
+                    text_raw = result.get("text", "").strip()
+                    text = filter_ignored_words(text_raw)
+                    if text and should_print_final(result, text):
                         # Clear partial line before printing final
                         if partial_prev:
                             print("\r" + " " * len(partial_prev) + "\r", end="")
@@ -88,7 +155,9 @@ def main():
                         print(text)
                 else:
                     if not args.no_partials:
-                        partial = json.loads(rec.PartialResult()).get("partial", "").strip()
+                        partial_obj = json.loads(rec.PartialResult())
+                        partial_raw = partial_obj.get("partial", "").strip()
+                        partial = filter_ignored_words(partial_raw)
                         if partial:
                             # Overwrite the same line for partials
                             line = f"[partial] {partial}"
@@ -104,8 +173,10 @@ def main():
     except KeyboardInterrupt:
         # Print any remaining final result
         try:
-            final = json.loads(rec.FinalResult()).get("text", "").strip()
-            if final:
+            final_obj = json.loads(rec.FinalResult())
+            final_raw = final_obj.get("text", "").strip()
+            final = filter_ignored_words(final_raw)
+            if final and should_print_final(final_obj, final):
                 print()
                 print(final)
         except Exception:
